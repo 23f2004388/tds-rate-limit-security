@@ -1,6 +1,6 @@
 // api/validate.js
-// Rate limiting: max 45 requests/minute, burst 11 (per second)
-// Uses Upstash Redis so parallel requests still get blocked correctly.
+// Rate limiting: max 45 requests/minute, burst 11 (using 5-second burst window)
+// Uses Upstash Redis so parallel requests across instances still get blocked.
 
 function nowMs() {
   return Date.now();
@@ -35,18 +35,23 @@ async function upstashEval(script, keys, args) {
 
 // Limits
 const LIMIT_PER_MIN = 45;
-const LIMIT_BURST_PER_SEC = 11;
+const LIMIT_BURST = 11;
 
-// Atomic Lua: increments minute & second counters, sets TTLs, checks limits.
-// Returns: { allowed(0/1), retry_after_sec, minuteCount, burstCount, blockedBy }
-const LUA_FIXED_WINDOW_DUAL = `
+// Burst window (key change): 5 seconds
+const BURST_WINDOW_MS = 5000;
+
+// Atomic Lua: increments minute & burst-window counters, sets TTLs, checks limits.
+// Returns: [allowed(0/1), retry_after_sec, minuteCount, burstCount, blockedBy]
+const LUA_DUAL_FIXED_WINDOW = `
 local minuteKey = KEYS[1]
 local burstKey  = KEYS[2]
 
 local minuteLimit = tonumber(ARGV[1])
 local burstLimit  = tonumber(ARGV[2])
+
 local minuteTTLms = tonumber(ARGV[3])
 local burstTTLms  = tonumber(ARGV[4])
+
 local retryMinSec = tonumber(ARGV[5])
 local retryBurstSec = tonumber(ARGV[6])
 
@@ -60,12 +65,10 @@ if b == 1 then
   redis.call("PEXPIRE", burstKey, burstTTLms)
 end
 
--- If burst exceeded => block quickly
 if b > burstLimit then
   return {0, retryBurstSec, m, b, "burst"}
 end
 
--- If minute exceeded => block
 if m > minuteLimit then
   return {0, retryMinSec, m, b, "minute"}
 end
@@ -123,27 +126,28 @@ export default async function handler(req, res) {
 
   const ip = getClientIp(req);
 
-  // Identity: prefer userId if provided, else IP.
-  // This prevents one user’s burst from blocking other users.
+  // Identity: prefer userId if provided; else IP.
   const ident = userId ? `user:${userId}` : `ip:${ip}`;
 
-  // Fixed windows:
   const now = Date.now();
-  const minuteWindow = Math.floor(now / 60000); // changes every minute
-  const secondWindow = Math.floor(now / 1000);  // changes every second
+
+  // Windows
+  const minuteWindow = Math.floor(now / 60000);
+  const burstWindow = Math.floor(now / BURST_WINDOW_MS);
 
   const minuteKey = `rl:${ident}:m:${minuteWindow}`;
-  const burstKey  = `rl:${ident}:s:${secondWindow}`;
+  const burstKey = `rl:${ident}:b:${burstWindow}`;
 
-  // TTLs: keep keys just beyond their window
-  const minuteTTLms = 70 * 1000; // 70s
-  const burstTTLms  = 3 * 1000;  // 3s
+  // TTLs: keep keys a bit longer than window to handle delays
+  const minuteTTLms = 70 * 1000;
+  const burstTTLms = BURST_WINDOW_MS + 2000;
 
-  // Retry-After values:
-  // - burst: 1s (next second window)
-  // - minute: seconds until next minute boundary
-  const secToNextMinute = Math.max(1, 60 - (new Date(now).getSeconds()));
-  const retryBurstSec = 1;
+  // Retry-after calculations
+  const secToNextMinute = Math.max(1, 60 - new Date(now).getSeconds());
+
+  const msIntoBurst = now % BURST_WINDOW_MS;
+  const msToNextBurst = BURST_WINDOW_MS - msIntoBurst;
+  const secToNextBurst = Math.max(1, Math.ceil(msToNextBurst / 1000));
 
   let allowed = 1;
   let retryAfterSec = 0;
@@ -153,15 +157,15 @@ export default async function handler(req, res) {
 
   try {
     const result = await upstashEval(
-      LUA_FIXED_WINDOW_DUAL,
+      LUA_DUAL_FIXED_WINDOW,
       [minuteKey, burstKey],
       [
         String(LIMIT_PER_MIN),
-        String(LIMIT_BURST_PER_SEC),
+        String(LIMIT_BURST),
         String(minuteTTLms),
         String(burstTTLms),
         String(secToNextMinute),
-        String(retryBurstSec),
+        String(secToNextBurst),
       ]
     );
 
@@ -171,7 +175,7 @@ export default async function handler(req, res) {
     burstCount = Number(result?.[3] ?? 0);
     blockedBy = String(result?.[4] ?? "none");
   } catch (e) {
-    // Fail OPEN (don’t block normal usage due to Redis blip)
+    // Fail OPEN (don't block normal usage if Redis has a hiccup)
     console.log(JSON.stringify({ event: "RATE_LIMIT_BACKEND_ERROR", error: String(e?.message || e) }));
     allowed = 1;
   }
@@ -195,7 +199,9 @@ export default async function handler(req, res) {
 
     return res.status(429).json({
       blocked: true,
-      reason: blockedBy === "burst" ? "Rate limit exceeded (burst)" : "Rate limit exceeded (per-minute)",
+      reason: blockedBy === "burst"
+        ? "Rate limit exceeded (burst)"
+        : "Rate limit exceeded (per-minute)",
       sanitizedOutput: "",
       confidence: 0.99,
       retryAfter: retryAfterSec,
@@ -206,7 +212,6 @@ export default async function handler(req, res) {
     });
   }
 
-  // Output sanitization (not the main focus here, but safe)
   const sanitizedOutput = input.replace(/[<>]/g, "");
 
   return res.status(200).json({
