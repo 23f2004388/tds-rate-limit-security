@@ -1,37 +1,31 @@
 // api/validate.js
-// Token bucket: 45 requests/min, burst 11
-// KEY FIX: use userId as primary key, fallback to IP
-// Redis shared store via Upstash REST EVAL (atomic)
+// Rate limiting: max 45 requests/minute, burst 11 (per second)
+// Uses Upstash Redis so parallel requests still get blocked correctly.
 
 function nowMs() {
   return Date.now();
 }
-
 function msSince(start) {
   return Math.max(1, Date.now() - start);
 }
-
 function getClientIp(req) {
   const xff = req.headers["x-forwarded-for"];
   if (typeof xff === "string" && xff.length > 0) return xff.split(",")[0].trim();
   return req.socket?.remoteAddress || "unknown";
 }
 
-async function upstashEval(lua, keys = [], args = []) {
+async function upstashEval(script, keys, args) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
   if (!url || !token) throw new Error("Missing Upstash Redis env vars");
 
-  const endpoint = `${url}/eval`;
-  const payload = { script: lua, keys, args };
-
-  const r = await fetch(endpoint, {
+  const r = await fetch(`${url}/eval`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify({ script, keys, args }),
   });
 
   if (!r.ok) throw new Error(`Upstash error: HTTP ${r.status}`);
@@ -39,52 +33,44 @@ async function upstashEval(lua, keys = [], args = []) {
   return data?.result;
 }
 
-// Config
-const CAPACITY = 11;
-const REFILL_PER_MIN = 45;
-const REFILL_RATE = REFILL_PER_MIN / 60000; // tokens per ms
+// Limits
+const LIMIT_PER_MIN = 45;
+const LIMIT_BURST_PER_SEC = 11;
 
-// Redis value: "tokens|last_ms"
-const LUA_TOKEN_BUCKET = `
-local key = KEYS[1]
-local capacity = tonumber(ARGV[1])
-local refill_rate = tonumber(ARGV[2]) -- tokens per ms
-local now_ms = tonumber(ARGV[3])
+// Atomic Lua: increments minute & second counters, sets TTLs, checks limits.
+// Returns: { allowed(0/1), retry_after_sec, minuteCount, burstCount, blockedBy }
+const LUA_FIXED_WINDOW_DUAL = `
+local minuteKey = KEYS[1]
+local burstKey  = KEYS[2]
 
-local v = redis.call("GET", key)
-local tokens = capacity
-local last = now_ms
+local minuteLimit = tonumber(ARGV[1])
+local burstLimit  = tonumber(ARGV[2])
+local minuteTTLms = tonumber(ARGV[3])
+local burstTTLms  = tonumber(ARGV[4])
+local retryMinSec = tonumber(ARGV[5])
+local retryBurstSec = tonumber(ARGV[6])
 
-if v then
-  local sep = string.find(v, "|")
-  if sep then
-    tokens = tonumber(string.sub(v, 1, sep-1)) or capacity
-    last = tonumber(string.sub(v, sep+1)) or now_ms
-  end
+local m = redis.call("INCR", minuteKey)
+if m == 1 then
+  redis.call("PEXPIRE", minuteKey, minuteTTLms)
 end
 
-local elapsed = now_ms - last
-if elapsed < 0 then elapsed = 0 end
-tokens = math.min(capacity, tokens + elapsed * refill_rate)
-last = now_ms
-
-local allowed = 0
-local retry_after_sec = 0
-
-if tokens >= 1 then
-  tokens = tokens - 1
-  allowed = 1
-else
-  local missing = 1 - tokens
-  local ms_to_wait = missing / refill_rate
-  retry_after_sec = math.ceil(ms_to_wait / 1000)
-  if retry_after_sec < 1 then retry_after_sec = 1 end
+local b = redis.call("INCR", burstKey)
+if b == 1 then
+  redis.call("PEXPIRE", burstKey, burstTTLms)
 end
 
--- keep key a bit longer than a minute
-redis.call("SET", key, tostring(tokens) .. "|" .. tostring(last), "PX", 120000)
+-- If burst exceeded => block quickly
+if b > burstLimit then
+  return {0, retryBurstSec, m, b, "burst"}
+end
 
-return { allowed, retry_after_sec, tokens }
+-- If minute exceeded => block
+if m > minuteLimit then
+  return {0, retryMinSec, m, b, "minute"}
+end
+
+return {1, 0, m, b, "none"}
 `;
 
 export default async function handler(req, res) {
@@ -107,7 +93,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // Parse body
+  // Parse body safely
   let body = {};
   try {
     body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
@@ -137,34 +123,57 @@ export default async function handler(req, res) {
 
   const ip = getClientIp(req);
 
-  // ✅ Keying strategy:
-  // - If userId exists => per-user bucket (prevents burst test affecting normal test)
-  // - else => per-ip bucket
-  const key = userId ? `rl:user:${userId}` : `rl:ip:${ip}`;
+  // Identity: prefer userId if provided, else IP.
+  // This prevents one user’s burst from blocking other users.
+  const ident = userId ? `user:${userId}` : `ip:${ip}`;
+
+  // Fixed windows:
+  const now = Date.now();
+  const minuteWindow = Math.floor(now / 60000); // changes every minute
+  const secondWindow = Math.floor(now / 1000);  // changes every second
+
+  const minuteKey = `rl:${ident}:m:${minuteWindow}`;
+  const burstKey  = `rl:${ident}:s:${secondWindow}`;
+
+  // TTLs: keep keys just beyond their window
+  const minuteTTLms = 70 * 1000; // 70s
+  const burstTTLms  = 3 * 1000;  // 3s
+
+  // Retry-After values:
+  // - burst: 1s (next second window)
+  // - minute: seconds until next minute boundary
+  const secToNextMinute = Math.max(1, 60 - (new Date(now).getSeconds()));
+  const retryBurstSec = 1;
 
   let allowed = 1;
   let retryAfterSec = 0;
+  let blockedBy = "none";
+  let minuteCount = 0;
+  let burstCount = 0;
 
   try {
     const result = await upstashEval(
-      LUA_TOKEN_BUCKET,
-      [key],
-      [String(CAPACITY), String(REFILL_RATE), String(Date.now())]
+      LUA_FIXED_WINDOW_DUAL,
+      [minuteKey, burstKey],
+      [
+        String(LIMIT_PER_MIN),
+        String(LIMIT_BURST_PER_SEC),
+        String(minuteTTLms),
+        String(burstTTLms),
+        String(secToNextMinute),
+        String(retryBurstSec),
+      ]
     );
 
     allowed = Number(result?.[0] ?? 1);
     retryAfterSec = Number(result?.[1] ?? 0);
+    minuteCount = Number(result?.[2] ?? 0);
+    burstCount = Number(result?.[3] ?? 0);
+    blockedBy = String(result?.[4] ?? "none");
   } catch (e) {
-    // ✅ Fail OPEN (don’t block everything if Redis blips)
-    console.log(
-      JSON.stringify({
-        event: "RATE_LIMIT_BACKEND_ERROR",
-        error: String(e?.message || e),
-        ts: new Date().toISOString(),
-      })
-    );
+    // Fail OPEN (don’t block normal usage due to Redis blip)
+    console.log(JSON.stringify({ event: "RATE_LIMIT_BACKEND_ERROR", error: String(e?.message || e) }));
     allowed = 1;
-    retryAfterSec = 0;
   }
 
   if (allowed !== 1) {
@@ -173,26 +182,31 @@ export default async function handler(req, res) {
     console.log(
       JSON.stringify({
         event: "RATE_LIMIT_BLOCK",
+        ident,
         userId: userId || "anon",
         ip,
-        key,
+        blockedBy,
         retryAfterSec,
+        minuteCount,
+        burstCount,
         ts: new Date().toISOString(),
       })
     );
 
     return res.status(429).json({
       blocked: true,
-      reason: "Rate limit exceeded",
+      reason: blockedBy === "burst" ? "Rate limit exceeded (burst)" : "Rate limit exceeded (per-minute)",
       sanitizedOutput: "",
       confidence: 0.99,
       retryAfter: retryAfterSec,
+      blockedBy,
       user: userId || "anon",
       ip,
       latency: msSince(start),
     });
   }
 
+  // Output sanitization (not the main focus here, but safe)
   const sanitizedOutput = input.replace(/[<>]/g, "");
 
   return res.status(200).json({
