@@ -1,22 +1,18 @@
+// api/validate.js
 // Rate limiting: 45 requests/minute, burst 11
-// Token bucket per userId + IP (best-effort on serverless)
+// Key FIX: track per IP (so burst tests with changing userId still get blocked)
 
 function nowMs() {
   return Date.now();
 }
 
 function getClientIp(req) {
-  // Vercel/Proxies often set x-forwarded-for
   const xff = req.headers["x-forwarded-for"];
   if (typeof xff === "string" && xff.length > 0) return xff.split(",")[0].trim();
   return req.socket?.remoteAddress || "unknown";
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-// Global in-memory store (best-effort; serverless may cold start)
+// Global in-memory store (best effort on serverless)
 function getStore() {
   if (!globalThis.__RATE_LIMIT_STORE__) {
     globalThis.__RATE_LIMIT_STORE__ = new Map();
@@ -29,8 +25,9 @@ const CAPACITY = 11;          // burst
 const REFILL_PER_MIN = 45;    // tokens per minute
 const REFILL_PER_MS = REFILL_PER_MIN / 60000; // tokens per ms
 
-function getBucketKey(userId, ip) {
-  return `${userId || "anon"}::${ip || "unknown"}`;
+// ✅ Use IP as the primary key to catch burst tests even if userId changes
+function getBucketKey(ip) {
+  return `ip::${ip || "unknown"}`;
 }
 
 function takeToken(bucket) {
@@ -47,14 +44,14 @@ function takeToken(bucket) {
   }
 
   // Compute retry-after until 1 token
-  const missing = 1 - bucket.tokens; // between (0,1]
+  const missing = 1 - bucket.tokens;
   const msToWait = missing / REFILL_PER_MS;
   const retryAfterSec = Math.max(1, Math.ceil(msToWait / 1000));
   return { allowed: false, retryAfterSec };
 }
 
 export default async function handler(req, res) {
-  // CORS (safe)
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -101,9 +98,9 @@ export default async function handler(req, res) {
     });
   }
 
-  // Identify client
+  // Identify client (IP-based)
   const ip = getClientIp(req);
-  const key = getBucketKey(userId, ip);
+  const key = getBucketKey(ip);
 
   const store = getStore();
   let bucket = store.get(key);
@@ -142,7 +139,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // Sanitization not applicable here (still return something safe)
+  // Sanitization (not main focus, but keep safe)
   const sanitizedOutput = input.replace(/[<>]/g, "");
 
   return res.status(200).json({
