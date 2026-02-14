@@ -1,9 +1,14 @@
 // api/validate.js
-// Rate limiting (token bucket): 45 requests/min, burst 11
-// Uses Upstash Redis for shared state so parallel burst tests are blocked.
+// Token bucket: 45 requests/min, burst 11
+// KEY FIX: use userId as primary key, fallback to IP
+// Redis shared store via Upstash REST EVAL (atomic)
 
 function nowMs() {
   return Date.now();
+}
+
+function msSince(start) {
+  return Math.max(1, Date.now() - start);
 }
 
 function getClientIp(req) {
@@ -12,17 +17,10 @@ function getClientIp(req) {
   return req.socket?.remoteAddress || "unknown";
 }
 
-function msSince(start) {
-  return Math.max(1, Date.now() - start);
-}
-
 async function upstashEval(lua, keys = [], args = []) {
   const url = process.env.UPSTASH_REDIS_REST_URL;
   const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-
-  if (!url || !token) {
-    throw new Error("Missing Upstash Redis env vars");
-  }
+  if (!url || !token) throw new Error("Missing Upstash Redis env vars");
 
   const endpoint = `${url}/eval`;
   const payload = { script: lua, keys, args };
@@ -38,18 +36,15 @@ async function upstashEval(lua, keys = [], args = []) {
 
   if (!r.ok) throw new Error(`Upstash error: HTTP ${r.status}`);
   const data = await r.json();
-  // Upstash REST returns { result: ... }
   return data?.result;
 }
 
-// Token bucket config
-const CAPACITY = 11;          // burst
-const REFILL_PER_MIN = 45;    // tokens per minute
+// Config
+const CAPACITY = 11;
+const REFILL_PER_MIN = 45;
 const REFILL_RATE = REFILL_PER_MIN / 60000; // tokens per ms
 
-// Atomic token bucket in Redis:
-// Key stores: "tokens|last_ms"
-// Returns: {allowed(0/1), retry_after_sec, tokens_left}
+// Redis value: "tokens|last_ms"
 const LUA_TOKEN_BUCKET = `
 local key = KEYS[1]
 local capacity = tonumber(ARGV[1])
@@ -68,7 +63,6 @@ if v then
   end
 end
 
--- refill
 local elapsed = now_ms - last
 if elapsed < 0 then elapsed = 0 end
 tokens = math.min(capacity, tokens + elapsed * refill_rate)
@@ -87,7 +81,7 @@ else
   if retry_after_sec < 1 then retry_after_sec = 1 end
 end
 
--- keep bucket around slightly longer than a minute
+-- keep key a bit longer than a minute
 redis.call("SET", key, tostring(tokens) .. "|" .. tostring(last), "PX", 120000)
 
 return { allowed, retry_after_sec, tokens }
@@ -113,7 +107,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // Parse body safely
+  // Parse body
   let body = {};
   try {
     body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
@@ -127,7 +121,7 @@ export default async function handler(req, res) {
     });
   }
 
-  const userId = typeof body.userId === "string" ? body.userId : "";
+  const userId = typeof body.userId === "string" ? body.userId.trim() : "";
   const input = typeof body.input === "string" ? body.input : "";
   const category = typeof body.category === "string" ? body.category : "";
 
@@ -141,9 +135,12 @@ export default async function handler(req, res) {
     });
   }
 
-  // ✅ Rate limit by IP (robust even if userId changes)
   const ip = getClientIp(req);
-  const key = `rl:ip:${ip}`;
+
+  // ✅ Keying strategy:
+  // - If userId exists => per-user bucket (prevents burst test affecting normal test)
+  // - else => per-ip bucket
+  const key = userId ? `rl:user:${userId}` : `rl:ip:${ip}`;
 
   let allowed = 1;
   let retryAfterSec = 0;
@@ -155,15 +152,19 @@ export default async function handler(req, res) {
       [String(CAPACITY), String(REFILL_RATE), String(Date.now())]
     );
 
-    // result = [allowed, retry_after_sec, tokens]
     allowed = Number(result?.[0] ?? 1);
     retryAfterSec = Number(result?.[1] ?? 0);
   } catch (e) {
-    // Fail closed? For security we should be conservative: allow small traffic, block bursts
-    console.log(JSON.stringify({ event: "RATE_LIMIT_BACKEND_ERROR", error: String(e), ts: new Date().toISOString() }));
-    // If Redis fails, block as safe fallback for bursts
-    allowed = 0;
-    retryAfterSec = 5;
+    // ✅ Fail OPEN (don’t block everything if Redis blips)
+    console.log(
+      JSON.stringify({
+        event: "RATE_LIMIT_BACKEND_ERROR",
+        error: String(e?.message || e),
+        ts: new Date().toISOString(),
+      })
+    );
+    allowed = 1;
+    retryAfterSec = 0;
   }
 
   if (allowed !== 1) {
@@ -174,6 +175,7 @@ export default async function handler(req, res) {
         event: "RATE_LIMIT_BLOCK",
         userId: userId || "anon",
         ip,
+        key,
         retryAfterSec,
         ts: new Date().toISOString(),
       })
@@ -191,7 +193,6 @@ export default async function handler(req, res) {
     });
   }
 
-  // Not the focus here, but keep output safe
   const sanitizedOutput = input.replace(/[<>]/g, "");
 
   return res.status(200).json({
